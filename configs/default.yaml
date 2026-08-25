@@ -1,0 +1,38 @@
+experiment:
+  name: retree_reproduction
+  seed: 0
+  max_searches: 8
+  passages_per_search: 5
+  summary_word_limit: 140
+  report_word_limit: 200
+  evidence_budget: 5
+  max_extracted_facts: 6
+  min_retrievals_before_stop: 1
+  output_dir: runs
+  datasets:
+    sample:
+      path: data/sample.jsonl
+
+llm:
+  base_url: ${LLM_BASE_URL}
+  api_key: ${LLM_API_KEY}
+  model: ${LLM_MODEL:qwen3-8b}
+  temperature: 0
+  max_tokens: 1200
+  timeout_seconds: 90
+
+judge:
+  enabled: false
+  base_url: ${JUDGE_BASE_URL}
+  api_key: ${JUDGE_API_KEY}
+  model: ${JUDGE_MODEL:gpt-5}
+  temperature: 0
+  max_tokens: 800
+  timeout_seconds: 90
+
+search:
+  provider: ${SEARCH_PROVIDER:custom}
+  base_url: ${SEARCH_BASE_URL}
+  api_key: ${SEARCH_API_KEY}
+  timeout_seconds: 45
+  max_passage_chars: 1200

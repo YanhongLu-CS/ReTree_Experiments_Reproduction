@@ -1,0 +1,476 @@
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any, Protocol
+
+from .clients import LLMClient
+from .prompts import (
+    confirm_revision_prompt,
+    conflict_prompt,
+    report_prompt,
+    summary_prompt,
+)
+from .types import Evidence, SearchPassage
+from .utils import token_overlap_score, truncate_words
+
+
+class AgentMemory(Protocol):
+    def render_context(self, question: str) -> str:
+        ...
+
+    def evidence_context(self, question: str) -> str:
+        ...
+
+    def integrate(
+        self,
+        question: str,
+        step: int,
+        new_facts: list[Evidence],
+        passages: list[SearchPassage],
+        llm: LLMClient,
+    ) -> tuple[dict[str, Any], list[Evidence]]:
+        ...
+
+    def all_evidence(self) -> list[Evidence]:
+        ...
+
+
+@dataclass
+class MemoryNode:
+    id: str
+    parent_id: str | None
+    summary: str = ""
+    evidence_ids: list[str] = field(default_factory=list)
+    child_ids: list[str] = field(default_factory=list)
+    revision_history: list[dict[str, Any]] = field(default_factory=list)
+
+
+class ReTreeMemory:
+    def __init__(self, evidence_budget: int = 5, summary_word_limit: int = 140) -> None:
+        self.evidence_budget = evidence_budget
+        self.summary_word_limit = summary_word_limit
+        self.nodes: dict[str, MemoryNode] = {"n0": MemoryNode(id="n0", parent_id=None, summary="")}
+        self.active_node_id = "n0"
+        self.evidence_by_id: dict[str, Evidence] = {}
+        self.evidence_counter = 0
+        self.node_counter = 0
+
+    def render_context(self, question: str) -> str:
+        node = self.nodes[self.active_node_id]
+        top = self._top_evidence(question, self._active_path_evidence())
+        evidence = "\n".join(_render_evidence(item) for item in top) or "No explicit evidence yet."
+        return (
+            f"Active branch: {self.active_node_id}\n"
+            f"Summary: {node.summary or 'No summary yet.'}\n"
+            f"Top evidence:\n{evidence}"
+        )
+
+    def evidence_context(self, question: str) -> str:
+        node = self.nodes[self.active_node_id]
+        evidence = "\n".join(_render_evidence(item) for item in self._active_path_evidence())
+        return f"Summary: {node.summary or 'No summary yet.'}\nEvidence:\n{evidence or 'No evidence.'}"
+
+    def all_evidence(self) -> list[Evidence]:
+        return self._active_path_evidence()
+
+    def integrate(
+        self,
+        question: str,
+        step: int,
+        new_facts: list[Evidence],
+        passages: list[SearchPassage],
+        llm: LLMClient,
+    ) -> tuple[dict[str, Any], list[Evidence]]:
+        if not new_facts:
+            return {"type": "noop", "reason": "no_extracted_facts"}, []
+
+        existing = self._top_evidence(question + " " + " ".join(item.text for item in new_facts), self._active_path_evidence())
+        proposed = llm.chat_json(conflict_prompt(question, existing, new_facts), fallback={"conflict": False})
+        conflict_event: dict[str, Any] = {
+            "conflict_detected": proposed.get("conflict") is True,
+            "repair_applied": False,
+            "pruned_node_count": 0,
+        }
+        if proposed.get("conflict") is True:
+            old_id = str(proposed.get("refuted_evidence_id", ""))
+            replacement_index = int(proposed.get("replacement_fact_index", -1))
+            old = self.evidence_by_id.get(old_id)
+            if old is not None and 0 <= replacement_index < len(new_facts):
+                node = self.nodes.get(old.introduced_node_id)
+                replacement = new_facts[replacement_index]
+                confirm = llm.chat_json(
+                    confirm_revision_prompt(
+                        question,
+                        node.summary if node else "",
+                        node.revision_history if node else [],
+                        old,
+                        replacement,
+                    ),
+                    fallback={"confirm": False},
+                )
+                if confirm.get("confirm") is True and node is not None:
+                    previous = old.__dict__.copy()
+                    self._replace_evidence(old, replacement, step, str(confirm.get("reason", "")))
+                    node.revision_history.append(
+                        {
+                            "step": step,
+                            "evidence_id": old.id,
+                            "previous": previous,
+                            "reason": str(confirm.get("reason", "")),
+                        }
+                    )
+                    self._regenerate_node_summary(question, node.id, llm)
+                    pruned = self._prune_descendants(node.id)
+                    self.active_node_id = node.id
+                    return {
+                        "type": "revision",
+                        "conflict_detected": True,
+                        "repair_applied": True,
+                        "replaced_evidence_id": old.id,
+                        "node_id": node.id,
+                        "pruned_nodes": pruned,
+                        "pruned_node_count": len(pruned),
+                        "reason": confirm.get("reason", ""),
+                    }, [old]
+                conflict_event.update(
+                    {
+                        "conflict_candidate_evidence_id": old.id,
+                        "conflict_rejected_reason": str(confirm.get("reason", "")),
+                    }
+                )
+            else:
+                conflict_event.update(
+                    {
+                        "conflict_rejected_reason": "invalid_conflict_reference",
+                        "conflict_candidate_evidence_id": old_id,
+                    }
+                )
+
+        child_id = self._new_node_id()
+        parent = self.nodes[self.active_node_id]
+        child = MemoryNode(id=child_id, parent_id=parent.id)
+        self.nodes[child_id] = child
+        parent.child_ids.append(child_id)
+        accepted = [self._assign_evidence_id(fact, child_id, step) for fact in new_facts]
+        child.evidence_ids.extend(item.id for item in accepted)
+        self.active_node_id = child_id
+        self._regenerate_node_summary(question, child_id, llm)
+        return {
+            "type": "append_child",
+            **conflict_event,
+            "node_id": child_id,
+            "accepted_evidence_ids": [item.id for item in accepted],
+        }, accepted
+
+    def _new_node_id(self) -> str:
+        self.node_counter += 1
+        return f"n{self.node_counter}"
+
+    def _next_evidence_id(self) -> str:
+        self.evidence_counter += 1
+        return f"e{self.evidence_counter}"
+
+    def _assign_evidence_id(self, fact: Evidence, node_id: str, step: int) -> Evidence:
+        fact.id = self._next_evidence_id()
+        fact.introduced_node_id = node_id
+        fact.created_step = step
+        self.evidence_by_id[fact.id] = fact
+        return fact
+
+    def _replace_evidence(self, old: Evidence, replacement: Evidence, step: int, reason: str) -> None:
+        old.history.append(
+            {
+                "step": step,
+                "previous_text": old.text,
+                "previous_url": old.url,
+                "replacement_text": replacement.text,
+                "replacement_url": replacement.url,
+                "reason": reason,
+            }
+        )
+        old.text = replacement.text
+        old.passage_id = replacement.passage_id
+        old.url = replacement.url
+        old.title = replacement.title
+        old.entity = replacement.entity
+        old.attribute = replacement.attribute
+        old.scope = replacement.scope
+        old.created_step = step
+        old.revision_count += 1
+
+    def _regenerate_node_summary(self, question: str, node_id: str, llm: LLMClient) -> None:
+        node = self.nodes[node_id]
+        evidence = self._path_evidence(node_id)
+        prior = self.nodes[node.parent_id].summary if node.parent_id else ""
+        parsed = llm.chat_json(summary_prompt(question, prior, evidence, self.summary_word_limit), fallback={})
+        node.summary = truncate_words(str(parsed.get("summary", "")).strip(), self.summary_word_limit)
+
+    def _prune_descendants(self, node_id: str) -> list[str]:
+        pruned: list[str] = []
+        node = self.nodes[node_id]
+        stack = list(node.child_ids)
+        node.child_ids = []
+        while stack:
+            child_id = stack.pop()
+            child = self.nodes.pop(child_id, None)
+            if child is None:
+                continue
+            pruned.append(child_id)
+            stack.extend(child.child_ids)
+            for evidence_id in child.evidence_ids:
+                self.evidence_by_id.pop(evidence_id, None)
+        return pruned
+
+    def _active_path_nodes(self) -> list[MemoryNode]:
+        node_ids: list[str] = []
+        current: str | None = self.active_node_id
+        while current is not None:
+            node_ids.append(current)
+            current = self.nodes[current].parent_id
+        return [self.nodes[node_id] for node_id in reversed(node_ids)]
+
+    def _path_evidence(self, node_id: str) -> list[Evidence]:
+        node_ids: list[str] = []
+        current: str | None = node_id
+        while current is not None:
+            node_ids.append(current)
+            current = self.nodes[current].parent_id
+        evidence: list[Evidence] = []
+        for current_id in reversed(node_ids):
+            node = self.nodes[current_id]
+            evidence.extend(self.evidence_by_id[evidence_id] for evidence_id in node.evidence_ids if evidence_id in self.evidence_by_id)
+        return evidence
+
+    def _active_path_evidence(self) -> list[Evidence]:
+        evidence: list[Evidence] = []
+        for node in self._active_path_nodes():
+            evidence.extend(self.evidence_by_id[evidence_id] for evidence_id in node.evidence_ids if evidence_id in self.evidence_by_id)
+        return evidence
+
+    def _top_evidence(self, question: str, evidence: list[Evidence]) -> list[Evidence]:
+        return sorted(evidence, key=lambda item: token_overlap_score(question, item.text), reverse=True)[: self.evidence_budget]
+
+
+class FlatUpdateMemory:
+    def __init__(self, evidence_budget: int = 5, summary_word_limit: int = 140) -> None:
+        self.evidence_budget = evidence_budget
+        self.summary_word_limit = summary_word_limit
+        self.summary = ""
+        self.evidence: list[Evidence] = []
+        self.evidence_by_id: dict[str, Evidence] = {}
+        self.revision_history: list[dict[str, Any]] = []
+        self.evidence_counter = 0
+
+    def render_context(self, question: str) -> str:
+        evidence = "\n".join(_render_evidence(item) for item in self._top_evidence(question))
+        return f"Summary: {self.summary or 'No summary yet.'}\nTop evidence:\n{evidence or 'No explicit evidence yet.'}"
+
+    def evidence_context(self, question: str) -> str:
+        evidence = "\n".join(_render_evidence(item) for item in self.evidence)
+        return f"Summary: {self.summary or 'No summary yet.'}\nEvidence:\n{evidence or 'No evidence.'}"
+
+    def all_evidence(self) -> list[Evidence]:
+        return list(self.evidence)
+
+    def integrate(
+        self,
+        question: str,
+        step: int,
+        new_facts: list[Evidence],
+        passages: list[SearchPassage],
+        llm: LLMClient,
+    ) -> tuple[dict[str, Any], list[Evidence]]:
+        if not new_facts:
+            return {"type": "noop", "reason": "no_extracted_facts"}, []
+
+        existing = self._top_evidence(question + " " + " ".join(item.text for item in new_facts))
+        proposed = llm.chat_json(conflict_prompt(question, existing, new_facts), fallback={"conflict": False})
+        conflict_event: dict[str, Any] = {
+            "conflict_detected": proposed.get("conflict") is True,
+            "repair_applied": False,
+            "pruned_node_count": 0,
+        }
+        if proposed.get("conflict") is True:
+            old_id = str(proposed.get("refuted_evidence_id", ""))
+            replacement_index = int(proposed.get("replacement_fact_index", -1))
+            old = self.evidence_by_id.get(old_id)
+            if old is not None and 0 <= replacement_index < len(new_facts):
+                replacement = new_facts[replacement_index]
+                confirm = llm.chat_json(
+                    confirm_revision_prompt(question, self.summary, self.revision_history, old, replacement),
+                    fallback={"confirm": False},
+                )
+                if confirm.get("confirm") is True:
+                    previous = old.__dict__.copy()
+                    _replace_evidence_in_place(old, replacement, step, str(confirm.get("reason", "")))
+                    self.revision_history.append(
+                        {
+                            "step": step,
+                            "evidence_id": old.id,
+                            "previous": previous,
+                            "reason": str(confirm.get("reason", "")),
+                        }
+                    )
+                    self._regenerate_summary(question, llm)
+                    return {
+                        "type": "flat_revision",
+                        "conflict_detected": True,
+                        "repair_applied": True,
+                        "pruned_node_count": 0,
+                        "replaced_evidence_id": old.id,
+                        "reason": confirm.get("reason", ""),
+                    }, [old]
+                conflict_event.update(
+                    {
+                        "conflict_candidate_evidence_id": old.id,
+                        "conflict_rejected_reason": str(confirm.get("reason", "")),
+                    }
+                )
+            else:
+                conflict_event.update(
+                    {
+                        "conflict_rejected_reason": "invalid_conflict_reference",
+                        "conflict_candidate_evidence_id": old_id,
+                    }
+                )
+
+        accepted = [self._assign_evidence_id(fact, step) for fact in new_facts]
+        self.evidence.extend(accepted)
+        self._regenerate_summary(question, llm)
+        return {"type": "flat_append", **conflict_event, "accepted_evidence_ids": [item.id for item in accepted]}, accepted
+
+    def _assign_evidence_id(self, fact: Evidence, step: int) -> Evidence:
+        self.evidence_counter += 1
+        fact.id = f"e{self.evidence_counter}"
+        fact.created_step = step
+        fact.introduced_node_id = "flat"
+        self.evidence_by_id[fact.id] = fact
+        return fact
+
+    def _regenerate_summary(self, question: str, llm: LLMClient) -> None:
+        parsed = llm.chat_json(summary_prompt(question, self.summary, self.evidence, self.summary_word_limit), fallback={})
+        self.summary = truncate_words(str(parsed.get("summary", "")).strip(), self.summary_word_limit)
+
+    def _top_evidence(self, question: str) -> list[Evidence]:
+        return sorted(self.evidence, key=lambda item: token_overlap_score(question, item.text), reverse=True)[: self.evidence_budget]
+
+
+class ReportMemory:
+    def __init__(self, report_word_limit: int = 200) -> None:
+        self.report_word_limit = report_word_limit
+        self.report = ""
+        self.visited: list[SearchPassage] = []
+
+    def render_context(self, question: str) -> str:
+        urls = "\n".join(f"- {item.title}: {item.url}" for item in self.visited[-16:])
+        return f"Report: {self.report or 'No report yet.'}\nVisited URLs:\n{urls or 'None'}"
+
+    def evidence_context(self, question: str) -> str:
+        snippets = "\n".join(f"{item.id}: {item.title} {item.url}\n{item.text}" for item in self.visited[-20:])
+        return f"Report: {self.report or 'No report yet.'}\nRecent visited snippets:\n{snippets or 'No snippets.'}"
+
+    def all_evidence(self) -> list[Evidence]:
+        return []
+
+    def integrate(
+        self,
+        question: str,
+        step: int,
+        new_facts: list[Evidence],
+        passages: list[SearchPassage],
+        llm: LLMClient,
+    ) -> tuple[dict[str, Any], list[Evidence]]:
+        self.visited.extend(passages)
+        parsed = llm.chat_json(report_prompt(question, self.report, passages, self.report_word_limit), fallback={})
+        self.report = truncate_words(str(parsed.get("summary", "")).strip(), self.report_word_limit)
+        return {
+            "type": "report_update",
+            "conflict_detected": False,
+            "repair_applied": False,
+            "pruned_node_count": 0,
+            "visited_count": len(self.visited),
+        }, []
+
+
+class FullTrajectoryMemory:
+    def __init__(self) -> None:
+        self.entries: list[str] = []
+        self.evidence: list[Evidence] = []
+        self.evidence_counter = 0
+
+    def render_context(self, question: str) -> str:
+        return "\n\n".join(self.entries) or "No trajectory yet."
+
+    def evidence_context(self, question: str) -> str:
+        evidence = "\n".join(_render_evidence(item) for item in self.evidence)
+        transcript = "\n\n".join(self.entries)
+        return f"Full trajectory:\n{transcript or 'No trajectory.'}\n\nExtracted evidence:\n{evidence or 'No explicit evidence.'}"
+
+    def all_evidence(self) -> list[Evidence]:
+        return list(self.evidence)
+
+    def integrate(
+        self,
+        question: str,
+        step: int,
+        new_facts: list[Evidence],
+        passages: list[SearchPassage],
+        llm: LLMClient,
+    ) -> tuple[dict[str, Any], list[Evidence]]:
+        accepted = []
+        for fact in new_facts:
+            self.evidence_counter += 1
+            fact.id = f"e{self.evidence_counter}"
+            fact.created_step = step
+            fact.introduced_node_id = "trajectory"
+            accepted.append(fact)
+        self.evidence.extend(accepted)
+        rendered = "\n".join(f"[{passage.rank}] {passage.title} {passage.url}\n{passage.text}" for passage in passages)
+        self.entries.append(f"Step {step} search results:\n{rendered}")
+        return {
+            "type": "trajectory_append",
+            "conflict_detected": False,
+            "repair_applied": False,
+            "pruned_node_count": 0,
+            "accepted_evidence_ids": [item.id for item in accepted],
+        }, accepted
+
+
+def make_memory(agent: str, evidence_budget: int, summary_word_limit: int, report_word_limit: int) -> AgentMemory:
+    if agent == "retree":
+        return ReTreeMemory(evidence_budget=evidence_budget, summary_word_limit=summary_word_limit)
+    if agent == "flat_update":
+        return FlatUpdateMemory(evidence_budget=evidence_budget, summary_word_limit=summary_word_limit)
+    if agent == "report_memory":
+        return ReportMemory(report_word_limit=report_word_limit)
+    if agent == "full_react":
+        return FullTrajectoryMemory()
+    raise ValueError(f"Unknown agent: {agent}")
+
+
+def _replace_evidence_in_place(old: Evidence, replacement: Evidence, step: int, reason: str) -> None:
+    old.history.append(
+        {
+            "step": step,
+            "previous_text": old.text,
+            "previous_url": old.url,
+            "replacement_text": replacement.text,
+            "replacement_url": replacement.url,
+            "reason": reason,
+        }
+    )
+    old.text = replacement.text
+    old.passage_id = replacement.passage_id
+    old.url = replacement.url
+    old.title = replacement.title
+    old.entity = replacement.entity
+    old.attribute = replacement.attribute
+    old.scope = replacement.scope
+    old.created_step = step
+    old.revision_count += 1
+
+
+def _render_evidence(evidence: Evidence) -> str:
+    slot = " ".join(part for part in [evidence.entity, evidence.attribute, evidence.scope] if part)
+    slot = f" ({slot})" if slot else ""
+    return f"{evidence.id}{slot}: {evidence.text} [source: {evidence.title} {evidence.url}]"
