@@ -39,9 +39,11 @@ class SearchAgent:
         )
         steps: list[AgentStep] = []
         searches_used = 0
+        real_retrievals_used = 0
         max_context_chars = 0
         stop_reason = "budget_exhausted"
         proposed_answer = ""
+        passage_limit = min(self.config.passages_per_search, 5)
 
         for step in range(1, self.config.max_searches + 1):
             context = memory.render_context(example.question)
@@ -49,8 +51,9 @@ class SearchAgent:
             action = self._choose_action(example.question, step, context)
             if (
                 action.get("action") == "stop"
-                and searches_used >= self.config.min_retrievals_before_stop
+                and real_retrievals_used >= self.config.min_retrievals_before_stop
                 and str(action.get("answer", "")).strip()
+                and self._contract_allows_stop(action)
             ):
                 proposed_answer = str(action.get("answer", "")).strip()
                 if self._supported(example.question, proposed_answer, memory.evidence_context(example.question)):
@@ -59,11 +62,13 @@ class SearchAgent:
                     break
 
             query = self._query_from_action(action, example.question, step, memory)
-            passages = self.search_client.search(query, self.config.passages_per_search)
+            passages = self.search_client.search(query, passage_limit)
             passages = self._namespace_passage_ids(example.id, step, passages)
             searches_used += 1
+            if passages:
+                real_retrievals_used += 1
             extracted = self._extract_evidence(example.question, step, passages)
-            memory_event, accepted = memory.integrate(example.question, step, extracted, passages, self.llm)
+            memory_event, accepted = memory.integrate(example.question, query, step, extracted, passages, self.llm)
             steps.append(
                 AgentStep(
                     step=step,
@@ -92,10 +97,11 @@ class SearchAgent:
             evidence=memory.all_evidence(),
             metadata={
                 "searches_used": searches_used,
+                "real_retrievals_used": real_retrievals_used,
                 "stop_reason": stop_reason,
                 "max_context_chars": max_context_chars,
                 "max_searches": self.config.max_searches,
-                "passages_per_search": self.config.passages_per_search,
+                "passages_per_search": passage_limit,
                 **memory_stats,
             },
         )
@@ -106,6 +112,15 @@ class SearchAgent:
         if action not in {"search", "stop"}:
             parsed["action"] = "search"
         return parsed
+
+    def _contract_allows_stop(self, action: dict[str, Any]) -> bool:
+        contract = action.get("answer_contract")
+        if not isinstance(contract, dict):
+            return False
+        if contract.get("final_slot_supported") is False:
+            return False
+        missing = contract.get("missing_relations")
+        return not (isinstance(missing, list) and any(_is_real_missing_relation(item) for item in missing))
 
     def _query_from_action(self, action: dict[str, Any], question: str, step: int, memory: AgentMemory) -> str:
         query = str(action.get("query", "")).strip()
@@ -121,16 +136,17 @@ class SearchAgent:
     def _extract_evidence(self, question: str, step: int, passages: list[SearchPassage]) -> list[Evidence]:
         if not passages:
             return []
-        parsed = self.llm.chat_json(extract_facts_prompt(question, passages, self.config.max_extracted_facts), fallback={"facts": []})
+        fact_limit = min(self.config.max_extracted_facts, 6)
+        parsed = self.llm.chat_json(extract_facts_prompt(question, passages, fact_limit), fallback={"facts": []})
         facts = parsed.get("facts", [])
         if not isinstance(facts, list):
             return []
         extracted: list[Evidence] = []
-        for index, item in enumerate(facts[: self.config.max_extracted_facts]):
+        for index, item in enumerate(facts[:fact_limit]):
             if not isinstance(item, dict):
                 continue
             try:
-                passage_index = int(item.get("passage_index", 0))
+                passage_index = int(item.get("passage_index", item.get("source_passage_index", item.get("source_index", 0))))
             except (TypeError, ValueError):
                 passage_index = 0
             if passage_index < 0 or passage_index >= len(passages):
@@ -197,3 +213,8 @@ def _memory_event_stats(steps: list[AgentStep]) -> dict[str, int]:
         "memory_revision_event_count": revision_event_count,
         "memory_pruned_node_count": pruned_node_count,
     }
+
+
+def _is_real_missing_relation(value: Any) -> bool:
+    text = normalize_text(str(value))
+    return text not in {"", "none", "no", "n a", "na", "n/a", "not applicable"}

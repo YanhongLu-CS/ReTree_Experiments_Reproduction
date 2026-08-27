@@ -86,8 +86,31 @@ class DryRunLLMClient(LLMClient):
             question = _after_label(prompt, "Question:")
             step = _after_label(prompt, "Step:")
             if step.startswith("1"):
-                return json.dumps({"action": "search", "query": question, "rationale": "Dry-run first retrieval."})
-            return json.dumps({"action": "stop", "answer": "Dry-run answer from gathered evidence."})
+                return json.dumps(
+                    {
+                        "action": "search",
+                        "query": question,
+                        "answer_contract": {
+                            "requested_value_type": "short answer",
+                            "resolved_intermediate_slots": [],
+                            "missing_relations": ["retrieved support"],
+                            "final_slot_supported": False,
+                        },
+                        "rationale": "Dry-run first retrieval.",
+                    }
+                )
+            return json.dumps(
+                {
+                    "action": "stop",
+                    "answer": "Dry-run answer from gathered evidence.",
+                    "answer_contract": {
+                        "requested_value_type": "short answer",
+                        "resolved_intermediate_slots": ["mock retrieval"],
+                        "missing_relations": [],
+                        "final_slot_supported": True,
+                    },
+                }
+            )
         if '"facts"' in prompt and "Passage" in prompt:
             first = _after_label(prompt, "[0]")
             sentence = first.split(". ")[0].strip()
@@ -98,6 +121,16 @@ class DryRunLLMClient(LLMClient):
             return json.dumps({"conflict": False, "refuted_evidence_id": "", "replacement_fact_index": -1, "reason": "Dry run does not revise."})
         if '"confirm"' in prompt:
             return json.dumps({"confirm": False, "reason": "Dry run does not revise."})
+        if '"answer_slot"' in prompt:
+            content = _after_label(prompt, "Evidence facts without IDs or URLs:")
+            return json.dumps(
+                {
+                    "answer_slot": "requested answer",
+                    "resolved_slots": [truncate_words(content.replace("\n", " "), 40)] if content else [],
+                    "open_slots": [],
+                    "unresolved_candidates": [],
+                }
+            )
         if '"summary"' in prompt:
             content = _after_label(prompt, "Evidence:")
             return json.dumps({"summary": truncate_words(content.replace("\n", " "), 120)})

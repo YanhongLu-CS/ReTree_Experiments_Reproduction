@@ -6,11 +6,14 @@ from .types import Evidence, SearchPassage
 
 
 POLICY_SYSTEM = """You are a careful long-horizon web QA agent.
+Treat the question as an answer contract: track the requested value type,
+resolved intermediate slots, missing relations, and whether evidence supports
+the final requested slot.
 Return JSON only. Use either:
-{"action":"search","query":"...","rationale":"..."}
+{"action":"search","query":"...","answer_contract":{"requested_value_type":"...","resolved_intermediate_slots":["..."],"missing_relations":["..."],"final_slot_supported":false},"rationale":"..."}
 or:
-{"action":"stop","answer":"...","rationale":"..."}
-Do not stop until the answer is supported by retrieved information."""
+{"action":"stop","answer":"...","answer_contract":{"requested_value_type":"...","resolved_intermediate_slots":["..."],"missing_relations":[],"final_slot_supported":true},"rationale":"..."}
+Do not stop until at least one real retrieval has occurred and the final requested slot is supported by retrieved evidence."""
 
 
 def policy_prompt(question: str, step: int, max_searches: int, memory_context: str) -> list[dict[str, str]]:
@@ -31,15 +34,17 @@ def policy_prompt(question: str, step: int, max_searches: int, memory_context: s
 
 def extract_facts_prompt(question: str, passages: list[SearchPassage], max_facts: int) -> list[dict[str, str]]:
     rendered = "\n\n".join(
-        f"[{index}] title={passage.title}\nurl={passage.url}\ntext={passage.text}"
+        f"[{index}] title={passage.title}\ntext={passage.text}"
         for index, passage in enumerate(passages)
     )
     return [
         {
             "role": "system",
             "content": (
-                "Extract compact, source-grounded facts that may help answer the question. "
+                "Extract compact, question-relevant atomic facts that may help answer the question. "
                 "Each fact must be directly supported by exactly one numbered passage. "
+                "Select the source only by passage_index; do not include or invent URLs. "
+                f"Emit at most {max_facts} facts. "
                 "Return JSON only: "
                 '{"facts":[{"passage_index":0,"fact":"...","entity":"...","attribute":"...","scope":"..."}]}'
             ),
@@ -58,9 +63,13 @@ def conflict_prompt(question: str, existing: list[Evidence], new_facts: list[Evi
         {
             "role": "system",
             "content": (
-                "Detect whether one new fact directly corrects or supersedes one existing fact "
-                "for the same entity, attribute, time/scope, or answer slot. "
-                "Do not mark merely complementary evidence as conflict. Return JSON only: "
+                "Detect whether one new fact directly refutes one existing fact. "
+                "A backtrack is allowed only when the new fact gives an incompatible value "
+                "for the same entity and attribute under the same scope/time. "
+                "Refinements, different entity senses, and competing but compatible candidates "
+                "must not be marked as conflicts. "
+                "This initial conflict call has no branch summary; decide only from the question, "
+                "selected existing facts, and new facts. Return JSON only: "
                 '{"conflict":false,"refuted_evidence_id":"","replacement_fact_index":-1,"reason":"..."}'
             ),
         },
@@ -71,17 +80,20 @@ def conflict_prompt(question: str, existing: list[Evidence], new_facts: list[Evi
 def confirm_revision_prompt(
     question: str,
     branch_summary: str,
-    revision_history: list[dict[str, str]],
+    target_history: list[dict[str, str]],
     old_evidence: Evidence,
-    new_evidence: Evidence,
+    new_facts: list[Evidence],
+    replacement_fact_index: int,
 ) -> list[dict[str, str]]:
-    history = "\n".join(str(item) for item in revision_history[-8:]) or "None"
+    history = "\n".join(str(item) for item in target_history[-8:]) or "None"
+    new = "\n".join(f"[{index}] {_format_evidence(evidence)}" for index, evidence in enumerate(new_facts)) or "None"
     return [
         {
             "role": "system",
             "content": (
-                "Decide whether the new evidence should replace the old evidence in memory. "
-                "Confirm only if the old evidence is likely wrong, stale, or less specific for the question. "
+                "Decide whether the targeted existing evidence should be repaired. "
+                "Apply the repair only when the contradiction is same-scope and the new fact is better supported. "
+                "Reject oscillations that revisit previously rejected values in the target change history. "
                 'Return JSON only: {"confirm":true,"reason":"..."}'
             ),
         },
@@ -90,9 +102,10 @@ def confirm_revision_prompt(
             "content": (
                 f"Question: {question}\n"
                 f"Branch summary: {branch_summary}\n"
-                f"Recent revision history: {history}\n"
-                f"Old evidence: {_format_evidence(old_evidence)}\n"
-                f"New evidence: {_format_evidence(new_evidence)}"
+                f"Target change history: {history}\n"
+                f"Targeted existing evidence: {_format_evidence(old_evidence)}\n"
+                f"Proposed replacement fact index: {replacement_fact_index}\n"
+                f"New facts:\n{new}"
             ),
         },
     ]
@@ -167,7 +180,10 @@ def support_prompt(question: str, proposed_answer: str, evidence_context: str) -
         {
             "role": "system",
             "content": (
-                "Judge whether the answer is supported by the provided evidence. "
+                "Judge whether the proposed answer satisfies the question's requested final answer slot "
+                "and is supported by the provided retrieved evidence. "
+                "Return false if the evidence only supports intermediate slots, related candidates, "
+                "or a seeded/parametric answer without retrieved support. "
                 'Return JSON only: {"supported":true,"reason":"..."}'
             ),
         },

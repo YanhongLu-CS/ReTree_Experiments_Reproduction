@@ -13,7 +13,7 @@ from .prompts import (
     summary_prompt,
 )
 from .types import Evidence, SearchPassage, StructuredSummary
-from .utils import token_overlap_score, truncate_words
+from .utils import normalize_text, token_overlap_score, truncate_words
 
 
 class AgentMemory(Protocol):
@@ -26,6 +26,7 @@ class AgentMemory(Protocol):
     def integrate(
         self,
         question: str,
+        query: str,
         step: int,
         new_facts: list[Evidence],
         passages: list[SearchPassage],
@@ -79,6 +80,7 @@ class ReTreeMemory:
     def integrate(
         self,
         question: str,
+        query: str,
         step: int,
         new_facts: list[Evidence],
         passages: list[SearchPassage],
@@ -87,7 +89,8 @@ class ReTreeMemory:
         if not new_facts:
             return {"type": "noop", "reason": "no_extracted_facts"}, []
 
-        existing = self._top_evidence(question + " " + " ".join(item.text for item in new_facts), self._active_path_evidence())
+        retrieved_context = _retrieved_context(query, passages)
+        existing = self._top_evidence(retrieved_context, self._active_path_evidence())
         proposed = llm.chat_json(conflict_prompt(question, existing, new_facts), fallback={"conflict": False}) if existing else {"conflict": False}
         conflict_event: dict[str, Any] = {
             "conflict_detected": proposed.get("conflict") is True,
@@ -101,59 +104,66 @@ class ReTreeMemory:
             if old is not None and 0 <= replacement_index < len(new_facts):
                 node = self.nodes.get(old.introduced_node_id)
                 replacement = new_facts[replacement_index]
-                confirm = llm.chat_json(
-                    confirm_revision_prompt(
-                        question,
-                        node.summary.render(self.summary_word_limit) if node else "",
-                        node.revision_history if node else [],
-                        old,
-                        replacement,
-                    ),
-                    fallback={"confirm": False},
-                )
-                if confirm.get("confirm") is True and node is not None:
-                    replacement.revision_count = old.revision_count + 1
-                    replacement.history.append(
+                if not _same_scope_repair_candidate(old, replacement):
+                    conflict_event.update(
                         {
-                            "step": step,
-                            "replaces_evidence_id": old.id,
-                            "previous_text": old.text,
-                            "previous_url": old.url,
-                            "reason": str(confirm.get("reason", "")),
+                            "conflict_candidate_evidence_id": old.id,
+                            "conflict_rejected_reason": "different_entity_attribute_or_scope",
                         }
                     )
-                    replacement = self._assign_evidence_id(replacement, node.id, step)
-                    self._replace_evidence_ref(node, old.id, replacement.id)
-                    node.revision_history.append(
-                        {
-                            "step": step,
+                else:
+                    confirm = llm.chat_json(
+                        confirm_revision_prompt(
+                            question,
+                            node.summary.render(self.summary_word_limit) if node else "",
+                            old.history,
+                            old,
+                            new_facts,
+                            replacement_index,
+                        ),
+                        fallback={"confirm": False},
+                    )
+                    if confirm.get("confirm") is True and node is not None:
+                        previous = old.__dict__.copy()
+                        _replace_evidence_in_place(old, replacement, step, str(confirm.get("reason", "")), preserve_created_step=True)
+                        node.revision_history.append(
+                            {
+                                "step": step,
+                                "evidence_id": old.id,
+                                "x_old": previous.get("text", ""),
+                                "x_new": replacement.text,
+                                "old_source": {
+                                    "passage_id": previous.get("passage_id", ""),
+                                    "title": previous.get("title", ""),
+                                    "url": previous.get("url", ""),
+                                },
+                                "new_source": {
+                                    "passage_id": replacement.passage_id,
+                                    "title": replacement.title,
+                                    "url": replacement.url,
+                                },
+                                "reason": str(confirm.get("reason", "")),
+                            }
+                        )
+                        self._regenerate_node_summary(question, node.id, llm, include_prior=False)
+                        pruned = self._prune_descendants(node.id)
+                        self.active_node_id = node.id
+                        return {
+                            "type": "revision",
+                            "conflict_detected": True,
+                            "repair_applied": True,
                             "replaced_evidence_id": old.id,
-                            "replacement_evidence_id": replacement.id,
-                            "previous": old.__dict__.copy(),
-                            "replacement": replacement.__dict__.copy(),
-                            "reason": str(confirm.get("reason", "")),
+                            "node_id": node.id,
+                            "pruned_nodes": pruned,
+                            "pruned_node_count": len(pruned),
+                            "reason": confirm.get("reason", ""),
+                        }, [old]
+                    conflict_event.update(
+                        {
+                            "conflict_candidate_evidence_id": old.id,
+                            "conflict_rejected_reason": str(confirm.get("reason", "")),
                         }
                     )
-                    self._regenerate_node_summary(question, node.id, llm)
-                    pruned = self._prune_descendants(node.id)
-                    self.active_node_id = node.id
-                    return {
-                        "type": "revision",
-                        "conflict_detected": True,
-                        "repair_applied": True,
-                        "replaced_evidence_id": old.id,
-                        "replacement_evidence_id": replacement.id,
-                        "node_id": node.id,
-                        "pruned_nodes": pruned,
-                        "pruned_node_count": len(pruned),
-                        "reason": confirm.get("reason", ""),
-                    }, [replacement]
-                conflict_event.update(
-                    {
-                        "conflict_candidate_evidence_id": old.id,
-                        "conflict_rejected_reason": str(confirm.get("reason", "")),
-                    }
-                )
             else:
                 conflict_event.update(
                     {
@@ -193,13 +203,10 @@ class ReTreeMemory:
         self.evidence_by_id[fact.id] = fact
         return fact
 
-    def _replace_evidence_ref(self, node: MemoryNode, old_id: str, replacement_id: str) -> None:
-        node.evidence_ids = [replacement_id if evidence_id == old_id else evidence_id for evidence_id in node.evidence_ids]
-
-    def _regenerate_node_summary(self, question: str, node_id: str, llm: LLMClient) -> None:
+    def _regenerate_node_summary(self, question: str, node_id: str, llm: LLMClient, *, include_prior: bool = True) -> None:
         node = self.nodes[node_id]
         evidence = self._path_evidence(node_id)
-        prior = self.nodes[node.parent_id].summary.render(self.summary_word_limit) if node.parent_id else ""
+        prior = self.nodes[node.parent_id].summary.render(self.summary_word_limit) if include_prior and node.parent_id else ""
         parsed = llm.chat_json(structured_summary_prompt(question, prior, evidence, self.summary_word_limit), fallback={})
         node.summary = _summary_from_payload(parsed, self.summary_word_limit)
 
@@ -271,6 +278,7 @@ class FlatUpdateMemory:
     def integrate(
         self,
         question: str,
+        query: str,
         step: int,
         new_facts: list[Evidence],
         passages: list[SearchPassage],
@@ -279,7 +287,7 @@ class FlatUpdateMemory:
         if not new_facts:
             return {"type": "noop", "reason": "no_extracted_facts"}, []
 
-        existing = self._top_evidence(question + " " + " ".join(item.text for item in new_facts))
+        existing = self._top_evidence(_retrieved_context(query, passages))
         proposed = llm.chat_json(conflict_prompt(question, existing, new_facts), fallback={"conflict": False}) if existing else {"conflict": False}
         conflict_event: dict[str, Any] = {
             "conflict_detected": proposed.get("conflict") is True,
@@ -293,7 +301,7 @@ class FlatUpdateMemory:
             if old is not None and 0 <= replacement_index < len(new_facts):
                 replacement = new_facts[replacement_index]
                 confirm = llm.chat_json(
-                    confirm_revision_prompt(question, self.summary, self.revision_history, old, replacement),
+                    confirm_revision_prompt(question, self.summary, old.history, old, new_facts, replacement_index),
                     fallback={"confirm": False},
                 )
                 if confirm.get("confirm") is True:
@@ -371,6 +379,7 @@ class ReportMemory:
     def integrate(
         self,
         question: str,
+        query: str,
         step: int,
         new_facts: list[Evidence],
         passages: list[SearchPassage],
@@ -408,6 +417,7 @@ class FullTrajectoryMemory:
     def integrate(
         self,
         question: str,
+        query: str,
         step: int,
         new_facts: list[Evidence],
         passages: list[SearchPassage],
@@ -444,7 +454,14 @@ def make_memory(agent: str, evidence_budget: int, summary_word_limit: int, repor
     raise ValueError(f"Unknown agent: {agent}")
 
 
-def _replace_evidence_in_place(old: Evidence, replacement: Evidence, step: int, reason: str) -> None:
+def _replace_evidence_in_place(
+    old: Evidence,
+    replacement: Evidence,
+    step: int,
+    reason: str,
+    *,
+    preserve_created_step: bool = False,
+) -> None:
     old.history.append(
         {
             "step": step,
@@ -462,8 +479,28 @@ def _replace_evidence_in_place(old: Evidence, replacement: Evidence, step: int, 
     old.entity = replacement.entity
     old.attribute = replacement.attribute
     old.scope = replacement.scope
-    old.created_step = step
+    if not preserve_created_step:
+        old.created_step = step
     old.revision_count += 1
+
+
+def _retrieved_context(query: str, passages: list[SearchPassage]) -> str:
+    parts = [query]
+    parts.extend(f"{passage.title} {passage.text}" for passage in passages)
+    return " ".join(part for part in parts if part).strip()
+
+
+def _same_scope_repair_candidate(old: Evidence, replacement: Evidence) -> bool:
+    for field_name in ("entity", "attribute", "scope"):
+        old_tokens = _slot_tokens(getattr(old, field_name))
+        new_tokens = _slot_tokens(getattr(replacement, field_name))
+        if old_tokens and new_tokens and old_tokens.isdisjoint(new_tokens):
+            return False
+    return True
+
+
+def _slot_tokens(value: str) -> set[str]:
+    return set(normalize_text(value).split())
 
 
 def _render_evidence(evidence: Evidence) -> str:

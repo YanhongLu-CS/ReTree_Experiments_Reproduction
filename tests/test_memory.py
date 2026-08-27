@@ -1,6 +1,6 @@
 from retree.clients import DryRunLLMClient
 from retree.memory import ReTreeMemory
-from retree.prompts import structured_summary_prompt
+from retree.prompts import extract_facts_prompt, structured_summary_prompt
 from retree.types import Evidence, SearchPassage, StructuredSummary
 
 
@@ -19,7 +19,7 @@ def test_retree_appends_child_and_tracks_active_evidence() -> None:
     passage = SearchPassage(id="p1", query="q", title="T", url="u", text="fact", rank=1)
     fact = Evidence(id="new_0", text="Amsterdam is in the Netherlands.", passage_id="p1", url="u", title="T", created_step=1)
 
-    event, accepted = memory.integrate("Where is Amsterdam?", 1, [fact], [passage], DryRunLLMClient())
+    event, accepted = memory.integrate("Where is Amsterdam?", "Amsterdam location", 1, [fact], [passage], DryRunLLMClient())
 
     assert event["type"] == "append_child"
     assert accepted[0].id == "e1"
@@ -49,6 +49,23 @@ def test_structured_summary_prompt_hides_evidence_ids_and_urls() -> None:
     assert "Source Title" not in rendered
 
 
+def test_extractor_binds_sources_by_passage_index_without_urls() -> None:
+    passage = SearchPassage(
+        id="p1",
+        query="q",
+        title="Indexed result",
+        url="https://source.example/result",
+        text="The answer-relevant fact appears here.",
+        rank=1,
+    )
+
+    messages = extract_facts_prompt("What is the answer?", [passage], 6)
+    rendered = "\n".join(message["content"] for message in messages)
+
+    assert "passage_index" in rendered
+    assert "https://source.example/result" not in rendered
+
+
 def test_retree_topk_uses_question_plus_summary() -> None:
     memory = ReTreeMemory(evidence_budget=1)
     memory.nodes["n0"].summary = StructuredSummary(answer_slot="bridge opening date")
@@ -62,7 +79,7 @@ def test_retree_topk_uses_question_plus_summary() -> None:
     assert "alpha unrelated detail" not in context
 
 
-def test_retree_revision_keeps_append_only_evidence_map_and_prunes_context_only() -> None:
+def test_retree_revision_repairs_same_evidence_id_and_prunes_context_only() -> None:
     memory = ReTreeMemory()
     passage1 = SearchPassage(id="p1", query="q", title="Old", url="old-url", text="old", rank=1)
     old = Evidence(id="new_0", text="Old answer slot.", passage_id="p1", url="old-url", title="Old", created_step=1)
@@ -76,7 +93,7 @@ def test_retree_revision_keeps_append_only_evidence_map_and_prunes_context_only(
             }
         ]
     )
-    memory.integrate("question", 1, [old], [passage1], first_llm)
+    memory.integrate("question", "old query", 1, [old], [passage1], first_llm)
 
     passage2 = SearchPassage(id="p2", query="q", title="Child", url="child-url", text="child", rank=1)
     child = Evidence(id="new_0", text="Child branch fact.", passage_id="p2", url="child-url", title="Child", created_step=2)
@@ -91,7 +108,7 @@ def test_retree_revision_keeps_append_only_evidence_map_and_prunes_context_only(
             },
         ]
     )
-    memory.integrate("question", 2, [child], [passage2], second_llm)
+    memory.integrate("question", "child query", 2, [child], [passage2], second_llm)
 
     passage3 = SearchPassage(id="p3", query="q", title="New", url="new-url", text="new", rank=1)
     replacement = Evidence(id="new_0", text="Corrected answer slot.", passage_id="p3", url="new-url", title="New", created_step=3)
@@ -107,16 +124,16 @@ def test_retree_revision_keeps_append_only_evidence_map_and_prunes_context_only(
             },
         ]
     )
-    event, accepted = memory.integrate("question", 3, [replacement], [passage3], third_llm)
+    event, accepted = memory.integrate("question", "corrected query", 3, [replacement], [passage3], third_llm)
 
     assert event["type"] == "revision"
     assert event["replaced_evidence_id"] == "e1"
-    assert event["replacement_evidence_id"] == "e3"
     assert event["pruned_nodes"] == ["n2"]
-    assert accepted[0].id == "e3"
-    assert set(memory.evidence_by_id) == {"e1", "e2", "e3"}
-    assert memory.evidence_by_id["e1"].url == "old-url"
-    assert memory.evidence_by_id["e1"].text == "Old answer slot."
+    assert accepted[0].id == "e1"
+    assert set(memory.evidence_by_id) == {"e1", "e2"}
+    assert memory.evidence_by_id["e1"].url == "new-url"
+    assert memory.evidence_by_id["e1"].text == "Corrected answer slot."
+    assert memory.evidence_by_id["e1"].created_step == 1
+    assert memory.evidence_by_id["e1"].history[0]["previous_url"] == "old-url"
     assert memory.evidence_by_id["e2"].url == "child-url"
-    assert memory.evidence_by_id["e3"].url == "new-url"
-    assert [item.id for item in memory._active_path_evidence()] == ["e3"]
+    assert [item.id for item in memory._active_path_evidence()] == ["e1"]
