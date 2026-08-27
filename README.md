@@ -142,6 +142,8 @@ ReTree/FlatUpdate memory diagnostics are included in both per-example `metadata`
 - `memory_revision_event_count`: number of memory revision events.
 - `memory_pruned_node_count`: number of ReTree descendant nodes pruned after repair.
 
+ReTree uses a structured 140-word context summary with `answer_slot`, `resolved_slots`, `open_slots`, and `unresolved_candidates`. Evidence IDs and URLs are excluded from summary generation, while top-k evidence remains addressable through stable evidence objects. ReTree policy context is constructed as `summary + TopK(active_path_evidence, question + summary)` with `k=5`. Descendant pruning removes branches from the active tree only; the run-level evidence map remains append-only.
+
 ## Notes For Faithful Reproduction
 
 - Use the same model family for all agents in one run.

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 from .types import Evidence, SearchPassage
 
 
@@ -115,6 +117,33 @@ def summary_prompt(question: str, prior_summary: str, evidence: list[Evidence], 
     ]
 
 
+def structured_summary_prompt(question: str, prior_summary: str, evidence: list[Evidence], word_limit: int) -> list[dict[str, str]]:
+    rendered = "\n".join(_format_evidence_for_summary(item) for item in evidence) or "No evidence yet."
+    return [
+        {
+            "role": "system",
+            "content": (
+                "Update a bounded structured memory summary for a long-horizon web QA agent. "
+                "The summary must record the requested answer slot, resolved intermediate slots, "
+                "remaining open slots, and unresolved candidates. "
+                "Do not include evidence IDs, passage IDs, URLs, source titles, or raw evidence objects. "
+                f"The rendered summary must fit in at most {word_limit} words. "
+                "Return JSON only: "
+                '{"answer_slot":"...","resolved_slots":["..."],"open_slots":["..."],"unresolved_candidates":["..."]}'
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"Question: {question}\n"
+                f"Prior structured summary:\n{prior_summary}\n"
+                "Evidence facts without IDs or URLs:\n"
+                f"{rendered}"
+            ),
+        },
+    ]
+
+
 def report_prompt(question: str, prior_report: str, passages: list[SearchPassage], word_limit: int) -> list[dict[str, str]]:
     rendered = "\n\n".join(f"{item.title}\n{item.url}\n{item.text}" for item in passages)
     return [
@@ -168,3 +197,12 @@ def _format_evidence(evidence: Evidence) -> str:
     slot = " ".join(part for part in [evidence.entity, evidence.attribute, evidence.scope] if part)
     slot = f" slot={slot}" if slot else ""
     return f"{evidence.id}: {evidence.text}{slot} source={source}"
+
+
+def _format_evidence_for_summary(evidence: Evidence) -> str:
+    slot = " ".join(part for part in [evidence.entity, evidence.attribute, evidence.scope] if part)
+    slot = f" slot={slot}" if slot else ""
+    text = re.sub(r"https?://\S+|www\.\S+", "", evidence.text)
+    text = re.sub(r"\b(?:evidence|passage|source)?\s*e\d+\b", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s+", " ", text).strip()
+    return f"- fact: {text}{slot}"

@@ -43,6 +43,35 @@ class Evidence:
 
 
 @dataclass
+class StructuredSummary:
+    answer_slot: str = ""
+    resolved_slots: list[str] = field(default_factory=list)
+    open_slots: list[str] = field(default_factory=list)
+    unresolved_candidates: list[str] = field(default_factory=list)
+
+    def render(self, word_limit: int = 140) -> str:
+        parts = [
+            f"Answer slot: {self.answer_slot or 'unknown'}",
+            f"Resolved slots: {_join_or_none(self.resolved_slots)}",
+            f"Open slots: {_join_or_none(self.open_slots)}",
+            f"Unresolved candidates: {_join_or_none(self.unresolved_candidates)}",
+        ]
+        return _truncate_words("; ".join(parts), word_limit)
+
+
+def _join_or_none(values: list[str]) -> str:
+    cleaned = [value.strip() for value in values if value.strip()]
+    return " | ".join(cleaned) if cleaned else "none"
+
+
+def _truncate_words(text: str, limit: int) -> str:
+    words = text.split()
+    if len(words) <= limit:
+        return text.strip()
+    return " ".join(words[:limit]).strip()
+
+
+@dataclass
 class ExtractedFact:
     text: str
     passage_index: int

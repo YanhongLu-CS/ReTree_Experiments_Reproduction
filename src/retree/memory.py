@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -8,9 +9,10 @@ from .prompts import (
     confirm_revision_prompt,
     conflict_prompt,
     report_prompt,
+    structured_summary_prompt,
     summary_prompt,
 )
-from .types import Evidence, SearchPassage
+from .types import Evidence, SearchPassage, StructuredSummary
 from .utils import token_overlap_score, truncate_words
 
 
@@ -39,7 +41,7 @@ class AgentMemory(Protocol):
 class MemoryNode:
     id: str
     parent_id: str | None
-    summary: str = ""
+    summary: StructuredSummary = field(default_factory=StructuredSummary)
     evidence_ids: list[str] = field(default_factory=list)
     child_ids: list[str] = field(default_factory=list)
     revision_history: list[dict[str, Any]] = field(default_factory=list)
@@ -49,7 +51,7 @@ class ReTreeMemory:
     def __init__(self, evidence_budget: int = 5, summary_word_limit: int = 140) -> None:
         self.evidence_budget = evidence_budget
         self.summary_word_limit = summary_word_limit
-        self.nodes: dict[str, MemoryNode] = {"n0": MemoryNode(id="n0", parent_id=None, summary="")}
+        self.nodes: dict[str, MemoryNode] = {"n0": MemoryNode(id="n0", parent_id=None)}
         self.active_node_id = "n0"
         self.evidence_by_id: dict[str, Evidence] = {}
         self.evidence_counter = 0
@@ -57,21 +59,22 @@ class ReTreeMemory:
 
     def render_context(self, question: str) -> str:
         node = self.nodes[self.active_node_id]
-        top = self._top_evidence(question, self._active_path_evidence())
+        summary = node.summary.render(self.summary_word_limit)
+        top = self._top_evidence(f"{question} {summary}", self._active_path_evidence())
         evidence = "\n".join(_render_evidence(item) for item in top) or "No explicit evidence yet."
         return (
             f"Active branch: {self.active_node_id}\n"
-            f"Summary: {node.summary or 'No summary yet.'}\n"
+            f"Summary: {summary}\n"
             f"Top evidence:\n{evidence}"
         )
 
     def evidence_context(self, question: str) -> str:
         node = self.nodes[self.active_node_id]
         evidence = "\n".join(_render_evidence(item) for item in self._active_path_evidence())
-        return f"Summary: {node.summary or 'No summary yet.'}\nEvidence:\n{evidence or 'No evidence.'}"
+        return f"Summary: {node.summary.render(self.summary_word_limit)}\nEvidence:\n{evidence or 'No evidence.'}"
 
     def all_evidence(self) -> list[Evidence]:
-        return self._active_path_evidence()
+        return list(self.evidence_by_id.values())
 
     def integrate(
         self,
@@ -101,7 +104,7 @@ class ReTreeMemory:
                 confirm = llm.chat_json(
                     confirm_revision_prompt(
                         question,
-                        node.summary if node else "",
+                        node.summary.render(self.summary_word_limit) if node else "",
                         node.revision_history if node else [],
                         old,
                         replacement,
@@ -109,13 +112,25 @@ class ReTreeMemory:
                     fallback={"confirm": False},
                 )
                 if confirm.get("confirm") is True and node is not None:
-                    previous = old.__dict__.copy()
-                    self._replace_evidence(old, replacement, step, str(confirm.get("reason", "")))
+                    replacement.revision_count = old.revision_count + 1
+                    replacement.history.append(
+                        {
+                            "step": step,
+                            "replaces_evidence_id": old.id,
+                            "previous_text": old.text,
+                            "previous_url": old.url,
+                            "reason": str(confirm.get("reason", "")),
+                        }
+                    )
+                    replacement = self._assign_evidence_id(replacement, node.id, step)
+                    self._replace_evidence_ref(node, old.id, replacement.id)
                     node.revision_history.append(
                         {
                             "step": step,
-                            "evidence_id": old.id,
-                            "previous": previous,
+                            "replaced_evidence_id": old.id,
+                            "replacement_evidence_id": replacement.id,
+                            "previous": old.__dict__.copy(),
+                            "replacement": replacement.__dict__.copy(),
                             "reason": str(confirm.get("reason", "")),
                         }
                     )
@@ -127,11 +142,12 @@ class ReTreeMemory:
                         "conflict_detected": True,
                         "repair_applied": True,
                         "replaced_evidence_id": old.id,
+                        "replacement_evidence_id": replacement.id,
                         "node_id": node.id,
                         "pruned_nodes": pruned,
                         "pruned_node_count": len(pruned),
                         "reason": confirm.get("reason", ""),
-                    }, [old]
+                    }, [replacement]
                 conflict_event.update(
                     {
                         "conflict_candidate_evidence_id": old.id,
@@ -177,33 +193,15 @@ class ReTreeMemory:
         self.evidence_by_id[fact.id] = fact
         return fact
 
-    def _replace_evidence(self, old: Evidence, replacement: Evidence, step: int, reason: str) -> None:
-        old.history.append(
-            {
-                "step": step,
-                "previous_text": old.text,
-                "previous_url": old.url,
-                "replacement_text": replacement.text,
-                "replacement_url": replacement.url,
-                "reason": reason,
-            }
-        )
-        old.text = replacement.text
-        old.passage_id = replacement.passage_id
-        old.url = replacement.url
-        old.title = replacement.title
-        old.entity = replacement.entity
-        old.attribute = replacement.attribute
-        old.scope = replacement.scope
-        old.created_step = step
-        old.revision_count += 1
+    def _replace_evidence_ref(self, node: MemoryNode, old_id: str, replacement_id: str) -> None:
+        node.evidence_ids = [replacement_id if evidence_id == old_id else evidence_id for evidence_id in node.evidence_ids]
 
     def _regenerate_node_summary(self, question: str, node_id: str, llm: LLMClient) -> None:
         node = self.nodes[node_id]
         evidence = self._path_evidence(node_id)
-        prior = self.nodes[node.parent_id].summary if node.parent_id else ""
-        parsed = llm.chat_json(summary_prompt(question, prior, evidence, self.summary_word_limit), fallback={})
-        node.summary = truncate_words(str(parsed.get("summary", "")).strip(), self.summary_word_limit)
+        prior = self.nodes[node.parent_id].summary.render(self.summary_word_limit) if node.parent_id else ""
+        parsed = llm.chat_json(structured_summary_prompt(question, prior, evidence, self.summary_word_limit), fallback={})
+        node.summary = _summary_from_payload(parsed, self.summary_word_limit)
 
     def _prune_descendants(self, node_id: str) -> list[str]:
         pruned: list[str] = []
@@ -217,8 +215,6 @@ class ReTreeMemory:
                 continue
             pruned.append(child_id)
             stack.extend(child.child_ids)
-            for evidence_id in child.evidence_ids:
-                self.evidence_by_id.pop(evidence_id, None)
         return pruned
 
     def _active_path_nodes(self) -> list[MemoryNode]:
@@ -474,3 +470,62 @@ def _render_evidence(evidence: Evidence) -> str:
     slot = " ".join(part for part in [evidence.entity, evidence.attribute, evidence.scope] if part)
     slot = f" ({slot})" if slot else ""
     return f"{evidence.id}{slot}: {evidence.text} [source: {evidence.title} {evidence.url}]"
+
+
+def _summary_from_payload(payload: dict[str, Any], word_limit: int) -> StructuredSummary:
+    summary = StructuredSummary(
+        answer_slot=_clean_summary_text(_coerce_text(payload.get("answer_slot") or payload.get("summary", ""))),
+        resolved_slots=_clean_summary_list(payload.get("resolved_slots")),
+        open_slots=_clean_summary_list(payload.get("open_slots")),
+        unresolved_candidates=_clean_summary_list(payload.get("unresolved_candidates")),
+    )
+    if not summary.answer_slot and not summary.resolved_slots and not summary.open_slots and not summary.unresolved_candidates:
+        summary.open_slots = ["requested answer"]
+    return _bound_structured_summary(summary, word_limit)
+
+
+def _bound_structured_summary(summary: StructuredSummary, word_limit: int) -> StructuredSummary:
+    while len(summary.render(word_limit * 10).split()) > word_limit:
+        if summary.unresolved_candidates:
+            summary.unresolved_candidates.pop()
+        elif summary.open_slots:
+            summary.open_slots.pop()
+        elif summary.resolved_slots:
+            summary.resolved_slots.pop()
+        else:
+            summary.answer_slot = truncate_words(summary.answer_slot, max(1, word_limit // 4))
+            break
+    return summary
+
+
+def _clean_summary_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        values = value
+    else:
+        values = [value]
+    cleaned: list[str] = []
+    for item in values:
+        text = _clean_summary_text(_coerce_text(item))
+        if text:
+            cleaned.append(text)
+    return cleaned
+
+
+def _coerce_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, dict):
+        return ", ".join(f"{key}: {_coerce_text(item)}" for key, item in value.items() if item not in (None, "", []))
+    if isinstance(value, list):
+        return ", ".join(_coerce_text(item) for item in value)
+    return str(value)
+
+
+def _clean_summary_text(text: str) -> str:
+    text = re.sub(r"https?://\S+|www\.\S+", "", text)
+    text = re.sub(r"\b(?:evidence|passage|source)?\s*e\d+\b", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\b(?:passage|source)\s*[:#]?\s*\w+://\S+", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip(" ;,")
