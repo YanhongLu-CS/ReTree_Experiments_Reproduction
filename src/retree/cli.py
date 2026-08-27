@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import json
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +34,7 @@ def main(argv: list[str] | None = None) -> None:
     run_parser.add_argument("--agents", nargs="+", choices=AGENTS, default=["retree"])
     run_parser.add_argument("--limit", type=int, default=None)
     run_parser.add_argument("--output-dir", default="")
+    run_parser.add_argument("--resume-from", default="", help="Resume an existing run directory and skip completed rows.")
     run_parser.add_argument("--dry-run", action="store_true", help="Use deterministic mock LLM/search clients.")
     run_parser.add_argument("--judge", action="store_true", help="Use configured judge model for semantic correctness.")
     run_parser.set_defaults(func=run_command)
@@ -45,7 +47,7 @@ def run_command(args: argparse.Namespace) -> None:
     config = load_yaml_config(args.config)
     experiment_cfg = config.get("experiment", {})
     dataset_path = args.dataset or _dataset_path_from_config(config, args.dataset_name)
-    output_dir = _make_output_dir(args.output_dir or experiment_cfg.get("output_dir", "runs"), args.dataset_name)
+    output_dir = ensure_dir(args.resume_from) if args.resume_from else _make_output_dir(args.output_dir or experiment_cfg.get("output_dir", "runs"), args.dataset_name)
     prediction_path = output_dir / "predictions.jsonl"
     metrics_path = output_dir / "metrics.json"
 
@@ -66,17 +68,32 @@ def run_command(args: argparse.Namespace) -> None:
     )
     examples = load_examples(dataset_path, limit=args.limit, seed=int(experiment_cfg.get("seed", 0)))
     per_agent_metrics: dict[str, list[dict[str, Any]]] = {agent: [] for agent in args.agents}
+    completed: set[tuple[str, str]] = set()
 
-    if prediction_path.exists():
+    if args.resume_from:
+        existing_rows, skipped_rows = _load_existing_predictions(prediction_path)
+        for row in existing_rows:
+            agent_name = str(row.get("agent", ""))
+            example_id = str(row.get("example_id", ""))
+            if agent_name in per_agent_metrics and example_id:
+                completed.add((agent_name, example_id))
+                metrics = row.get("metrics", {})
+                if isinstance(metrics, dict):
+                    per_agent_metrics[agent_name].append(metrics)
+        print(f"Resuming from {output_dir}: {len(completed)} completed rows, {skipped_rows} unreadable rows skipped.")
+
+    if prediction_path.exists() and not args.resume_from:
         prediction_path.unlink()
 
     for agent_name in args.agents:
         agent = SearchAgent(agent_name, llm, search, agent_cfg)
-        for example in tqdm(examples, desc=f"{agent_name}"):
+        remaining_examples = [example for example in examples if (agent_name, example.id) not in completed]
+        for example in tqdm(remaining_examples, desc=f"{agent_name}"):
             result = agent.run(example)
             result.metrics = evaluate_run(result, example.answers, judge)
             per_agent_metrics[agent_name].append(result.metrics)
             append_jsonl(prediction_path, result.to_jsonable())
+            completed.add((agent_name, example.id))
 
     aggregate = {agent: aggregate_metrics(rows) for agent, rows in per_agent_metrics.items()}
     write_json(metrics_path, {"output_dir": str(output_dir), "dataset": str(dataset_path), "agents": args.agents, "aggregate": aggregate})
@@ -94,6 +111,28 @@ def _dataset_path_from_config(config: dict[str, Any], name: str) -> str:
 def _make_output_dir(root: str, dataset_name: str) -> Path:
     stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
     return ensure_dir(Path(root) / f"{dataset_name}_{stamp}")
+
+
+def _load_existing_predictions(path: Path) -> tuple[list[dict[str, Any]], int]:
+    if not path.exists():
+        return [], 0
+    rows: list[dict[str, Any]] = []
+    skipped = 0
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                skipped += 1
+                continue
+            if isinstance(row, dict):
+                rows.append(row)
+            else:
+                skipped += 1
+    return rows, skipped
 
 
 def _make_llm(config: dict[str, Any]) -> LLMClient:

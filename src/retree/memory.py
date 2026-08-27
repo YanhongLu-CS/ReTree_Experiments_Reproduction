@@ -85,7 +85,7 @@ class ReTreeMemory:
             return {"type": "noop", "reason": "no_extracted_facts"}, []
 
         existing = self._top_evidence(question + " " + " ".join(item.text for item in new_facts), self._active_path_evidence())
-        proposed = llm.chat_json(conflict_prompt(question, existing, new_facts), fallback={"conflict": False})
+        proposed = llm.chat_json(conflict_prompt(question, existing, new_facts), fallback={"conflict": False}) if existing else {"conflict": False}
         conflict_event: dict[str, Any] = {
             "conflict_detected": proposed.get("conflict") is True,
             "repair_applied": False,
@@ -284,7 +284,7 @@ class FlatUpdateMemory:
             return {"type": "noop", "reason": "no_extracted_facts"}, []
 
         existing = self._top_evidence(question + " " + " ".join(item.text for item in new_facts))
-        proposed = llm.chat_json(conflict_prompt(question, existing, new_facts), fallback={"conflict": False})
+        proposed = llm.chat_json(conflict_prompt(question, existing, new_facts), fallback={"conflict": False}) if existing else {"conflict": False}
         conflict_event: dict[str, Any] = {
             "conflict_detected": proposed.get("conflict") is True,
             "repair_applied": False,

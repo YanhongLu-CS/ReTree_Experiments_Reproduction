@@ -16,7 +16,7 @@ except ImportError:  # pragma: no cover - fallback parser covers the bundled con
 try:
     from dotenv import load_dotenv
 except ImportError:  # pragma: no cover - tiny fallback for dry-runs before dependencies are installed.
-    def load_dotenv() -> None:  # type: ignore[no-redef]
+    def load_dotenv(override: bool = False) -> None:  # type: ignore[no-redef]
         env_path = Path(".env")
         if not env_path.exists():
             return
@@ -25,14 +25,16 @@ except ImportError:  # pragma: no cover - tiny fallback for dry-runs before depe
             if not line or line.startswith("#") or "=" not in line:
                 continue
             key, value = line.split("=", 1)
-            os.environ.setdefault(key.strip(), value.strip())
+            key = key.strip()
+            if override or key not in os.environ:
+                os.environ[key] = value.strip()
 
 
 _ENV_PATTERN = re.compile(r"\$\{([^}:]+)(?::([^}]*))?\}")
 
 
 def load_yaml_config(path: str | Path) -> dict[str, Any]:
-    load_dotenv()
+    load_dotenv(override=True)
     text = Path(path).read_text(encoding="utf-8")
     text = _interpolate_env(text)
     data = yaml.safe_load(text) if yaml is not None else _parse_simple_yaml(text)
