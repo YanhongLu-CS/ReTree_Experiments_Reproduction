@@ -4,8 +4,8 @@ from collections import Counter
 from typing import Any
 
 from .clients import LLMClient
-from .types import RunResult
-from .utils import normalize_text
+from .types import RunResult, SearchPassage
+from .utils import normalize_text, token_overlap_score
 
 
 def exact_match(prediction: str, gold_answers: list[str]) -> bool:
@@ -41,6 +41,9 @@ def evaluate_run(result: RunResult, gold_answers: list[str], judge: LLMClient | 
             metrics["llm_judge_error"] = _compact_exception(exc)
     if result.claims and result.evidence:
         metrics.update(citation_diagnostics(result))
+    elif result.claims and result.agent == "report_memory" and result.passages:
+        metrics.update({"citation_recall_proxy": 0.0, "citation_precision_proxy": 0.0})
+    if result.claims and (result.evidence or (result.agent == "report_memory" and result.passages)):
         if judge is not None:
             metrics["citation_support_failed"] = 0
             try:
@@ -101,8 +104,15 @@ def citation_diagnostics(result: RunResult) -> dict[str, Any]:
 
 def judge_citation_support(judge: LLMClient, result: RunResult) -> dict[str, Any]:
     evidence_by_id = {item.id: item for item in result.evidence}
+    passage_by_url = _passage_by_url(result.passages)
+    if not evidence_by_id and result.agent == "report_memory":
+        return _judge_report_posthoc_citation_support(judge, result)
+
     judged = 0
-    supported = 0
+    entails = 0
+    neutral = 0
+    contradicts = 0
+    missing_passages = 0
     for claim in result.claims:
         if not isinstance(claim, dict):
             continue
@@ -110,24 +120,132 @@ def judge_citation_support(judge: LLMClient, result: RunResult) -> dict[str, Any
         evidence_ids = claim.get("evidence_ids", [])
         if not claim_text or not isinstance(evidence_ids, list):
             continue
-        cited = [evidence_by_id[str(item)] for item in evidence_ids if str(item) in evidence_by_id]
-        if not cited:
+        for evidence_id in evidence_ids:
+            evidence = evidence_by_id.get(str(evidence_id))
+            if evidence is None:
+                continue
+            passage = passage_by_url.get(evidence.url)
+            if passage is None:
+                missing_passages += 1
+                continue
+            label = _judge_passage_nli(judge, result.question, claim_text, passage, evidence.id, evidence.text, evidence.url)
+            judged += 1
+            if label == "entails":
+                entails += 1
+            elif label == "contradicts":
+                contradicts += 1
+            else:
+                neutral += 1
+    precision = entails / judged if judged else 0.0
+    return {
+        "citation_support_judged": judged,
+        "citation_support_precision": precision,
+        "citation_entailment_precision": precision,
+        "citation_entails_count": entails,
+        "citation_neutral_count": neutral,
+        "citation_contradicts_count": contradicts,
+        "citation_missing_passage_count": missing_passages,
+    }
+
+
+def _judge_report_posthoc_citation_support(judge: LLMClient, result: RunResult) -> dict[str, Any]:
+    judged_claims = 0
+    passage_pairs_judged = 0
+    entails = 0
+    neutral = 0
+    contradicts = 0
+    reconstructed = 0
+    for claim in result.claims:
+        if not isinstance(claim, dict):
             continue
-        evidence_text = "\n".join(f"{item.id}: {item.text}\nsource={item.url}" for item in cited)
-        messages = [
-            {
-                "role": "system",
-                "content": (
-                    "Judge whether the claim is fully supported by the cited evidence. "
-                    'Return JSON only: {"supported":true,"reason":"..."}'
-                ),
-            },
-            {"role": "user", "content": f"Question: {result.question}\nClaim: {claim_text}\nCited evidence:\n{evidence_text}"},
-        ]
-        parsed = judge.chat_json(messages, fallback={"supported": False})
-        judged += 1
-        supported += 1 if parsed.get("supported") is True else 0
-    return {"citation_support_judged": judged, "citation_support_precision": supported / judged if judged else 0.0}
+        claim_text = str(claim.get("claim", "")).strip()
+        if not claim_text:
+            continue
+        candidates = sorted(
+            result.passages,
+            key=lambda passage: token_overlap_score(claim_text, passage.raw_text or passage.text),
+            reverse=True,
+        )[:5]
+        if not candidates:
+            continue
+        judged_claims += 1
+        labels = []
+        for passage in candidates:
+            labels.append(_judge_passage_nli(judge, result.question, claim_text, passage, "posthoc", "", passage.url))
+            passage_pairs_judged += 1
+        if "entails" in labels:
+            entails += 1
+            reconstructed += 1
+        elif "contradicts" in labels:
+            contradicts += 1
+        else:
+            neutral += 1
+    precision = entails / judged_claims if judged_claims else 0.0
+    return {
+        "citation_support_judged": judged_claims,
+        "citation_support_precision": precision,
+        "citation_entailment_precision": precision,
+        "citation_entails_count": entails,
+        "citation_neutral_count": neutral,
+        "citation_contradicts_count": contradicts,
+        "citation_missing_passage_count": 0,
+        "citation_posthoc_reconstructed_count": reconstructed,
+        "citation_passage_pairs_judged": passage_pairs_judged,
+    }
+
+
+def _judge_passage_nli(
+    judge: LLMClient,
+    question: str,
+    claim_text: str,
+    passage: SearchPassage,
+    evidence_id: str,
+    evidence_text: str,
+    evidence_url: str,
+) -> str:
+    passage_text = passage.raw_text or passage.text
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are a passage-level NLI judge. Label whether the passage entails, "
+                "is neutral toward, or contradicts the claim. Check the cited passage, "
+                "not the claim or evidence text in isolation. Return JSON only: "
+                '{"label":"entails","reason":"..."}'
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"Question: {question}\n"
+                f"Claim: {claim_text}\n"
+                f"Evidence identifier: {evidence_id}\n"
+                f"Current evidence text: {evidence_text or 'N/A'}\n"
+                f"Current evidence URL: {evidence_url or passage.url}\n"
+                f"Passage URL: {passage.url}\n"
+                f"Passage text:\n{passage_text}"
+            ),
+        },
+    ]
+    parsed = judge.chat_json(messages, fallback={"label": "neutral"})
+    return _normalize_nli_label(parsed.get("label"))
+
+
+def _passage_by_url(passages: list[SearchPassage]) -> dict[str, SearchPassage]:
+    mapped: dict[str, SearchPassage] = {}
+    for passage in passages:
+        if passage.url and passage.url not in mapped:
+            mapped[passage.url] = passage
+    return mapped
+
+
+def _normalize_nli_label(value: Any) -> str:
+    text = normalize_text(str(value))
+    if text in {"entails", "entail", "entailed", "support", "supports", "supported"}:
+        return "entails"
+    if text in {"contradicts", "contradict", "contradiction", "refutes", "refute"}:
+        return "contradicts"
+    return "neutral"
 
 
 def _token_f1_one(prediction: str, answer: str) -> float:

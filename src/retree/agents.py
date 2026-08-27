@@ -51,15 +51,12 @@ class SearchAgent:
             action = self._choose_action(example.question, step, context)
             if (
                 action.get("action") == "stop"
-                and real_retrievals_used >= self.config.min_retrievals_before_stop
-                and str(action.get("answer", "")).strip()
-                and self._contract_allows_stop(action)
+                and self._supported(example.question, memory.evidence_context(example.question), str(action.get("answer", "")).strip())
             ):
                 proposed_answer = str(action.get("answer", "")).strip()
-                if self._supported(example.question, proposed_answer, memory.evidence_context(example.question)):
-                    steps.append(AgentStep(step=step, action="stop", answer=proposed_answer))
-                    stop_reason = "model_stop_supported"
-                    break
+                steps.append(AgentStep(step=step, action="stop", answer=proposed_answer))
+                stop_reason = "model_stop_supported"
+                break
 
             query = self._query_from_action(action, example.question, step, memory)
             passages = self.search_client.search(query, passage_limit)
@@ -68,7 +65,7 @@ class SearchAgent:
             if passages:
                 real_retrievals_used += 1
             extracted = self._extract_evidence(example.question, step, passages)
-            memory_event, accepted = memory.integrate(example.question, query, step, extracted, passages, self.llm)
+            memory_event, accepted = memory.integrate(example.question, query, step, extracted, passages, self.llm, action=action)
             steps.append(
                 AgentStep(
                     step=step,
@@ -86,6 +83,7 @@ class SearchAgent:
         if not isinstance(claims, list):
             claims = []
         memory_stats = _memory_event_stats(steps)
+        passages = _dedupe_passages(steps)
 
         return RunResult(
             example_id=example.id,
@@ -95,6 +93,7 @@ class SearchAgent:
             claims=claims,
             steps=steps,
             evidence=memory.all_evidence(),
+            passages=passages,
             metadata={
                 "searches_used": searches_used,
                 "real_retrievals_used": real_retrievals_used,
@@ -112,15 +111,6 @@ class SearchAgent:
         if action not in {"search", "stop"}:
             parsed["action"] = "search"
         return parsed
-
-    def _contract_allows_stop(self, action: dict[str, Any]) -> bool:
-        contract = action.get("answer_contract")
-        if not isinstance(contract, dict):
-            return False
-        if contract.get("final_slot_supported") is False:
-            return False
-        missing = contract.get("missing_relations")
-        return not (isinstance(missing, list) and any(_is_real_missing_relation(item) for item in missing))
 
     def _query_from_action(self, action: dict[str, Any], question: str, step: int, memory: AgentMemory) -> str:
         query = str(action.get("query", "")).strip()
@@ -170,10 +160,10 @@ class SearchAgent:
             )
         return extracted
 
-    def _supported(self, question: str, proposed_answer: str, evidence_context: str) -> bool:
+    def _supported(self, question: str, evidence_context: str, proposed_answer: str = "") -> bool:
         if not self.config.support_check:
             return True
-        parsed = self.llm.chat_json(support_prompt(question, proposed_answer, evidence_context), fallback={"supported": False})
+        parsed = self.llm.chat_json(support_prompt(question, evidence_context, proposed_answer), fallback={"supported": False})
         return parsed.get("supported") is True
 
     def _final_answer(self, question: str, proposed_answer: str, evidence_context: str) -> dict[str, Any]:
@@ -215,6 +205,14 @@ def _memory_event_stats(steps: list[AgentStep]) -> dict[str, int]:
     }
 
 
-def _is_real_missing_relation(value: Any) -> bool:
-    text = normalize_text(str(value))
-    return text not in {"", "none", "no", "n a", "na", "n/a", "not applicable"}
+def _dedupe_passages(steps: list[AgentStep]) -> list[SearchPassage]:
+    seen: set[str] = set()
+    passages: list[SearchPassage] = []
+    for step in steps:
+        for passage in step.passages:
+            key = passage.url or passage.id
+            if key in seen:
+                continue
+            seen.add(key)
+            passages.append(passage)
+    return passages

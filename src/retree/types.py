@@ -23,6 +23,7 @@ class SearchPassage:
     url: str
     text: str
     rank: int
+    raw_text: str = ""
     raw: dict[str, Any] = field(default_factory=dict)
 
 
@@ -100,16 +101,21 @@ class RunResult:
     claims: list[dict[str, Any]]
     steps: list[AgentStep]
     evidence: list[Evidence]
+    passages: list[SearchPassage] = field(default_factory=list)
     metrics: dict[str, Any] = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_jsonable(self) -> dict[str, Any]:
+        evidence_map = {evidence.id: _evidence_json(evidence) for evidence in self.evidence}
+        passage_map = {_passage_map_key(passage): _passage_json(passage) for passage in self.passages}
         return {
             "example_id": self.example_id,
             "agent": self.agent,
             "question": self.question,
             "answer": self.answer,
             "claims": self.claims,
+            "passages": [_passage_json(passage) for passage in self.passages],
+            "passage_map": passage_map,
             "steps": [
                 {
                     "step": step.step,
@@ -122,7 +128,41 @@ class RunResult:
                 }
                 for step in self.steps
             ],
-            "evidence": [evidence.__dict__ for evidence in self.evidence],
+            "evidence": [_evidence_json(evidence) for evidence in self.evidence],
+            "evidence_map": evidence_map,
             "metrics": self.metrics,
             "metadata": self.metadata,
         }
+
+
+def _passage_map_key(passage: SearchPassage) -> str:
+    return passage.url or passage.id
+
+
+def _passage_json(passage: SearchPassage) -> dict[str, Any]:
+    return {
+        "id": passage.id,
+        "query": passage.query,
+        "title": passage.title,
+        "url": passage.url,
+        "text": passage.text,
+        "raw_text": passage.raw_text or passage.text,
+        "rank": passage.rank,
+    }
+
+
+def _evidence_json(evidence: Evidence) -> dict[str, Any]:
+    return {
+        "id": evidence.id,
+        "text": evidence.text,
+        "passage_id": evidence.passage_id,
+        "url": evidence.url,
+        "title": evidence.title,
+        "created_step": evidence.created_step,
+        "entity": evidence.entity,
+        "attribute": evidence.attribute,
+        "scope": evidence.scope,
+        "introduced_node_id": evidence.introduced_node_id,
+        "revision_count": evidence.revision_count,
+        "history": evidence.history,
+    }

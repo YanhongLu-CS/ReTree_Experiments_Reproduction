@@ -175,21 +175,22 @@ def report_prompt(question: str, prior_report: str, passages: list[SearchPassage
     ]
 
 
-def support_prompt(question: str, proposed_answer: str, evidence_context: str) -> list[dict[str, str]]:
+def support_prompt(question: str, evidence_context: str, proposed_answer: str = "") -> list[dict[str, str]]:
     return [
         {
             "role": "system",
             "content": (
-                "Judge whether the proposed answer satisfies the question's requested final answer slot "
-                "and is supported by the provided retrieved evidence. "
+                "Judge whether the active retrieved evidence is sufficient to answer the question's "
+                "requested final answer slot. If a proposed answer is provided, also check that it "
+                "satisfies the question and is supported by the active evidence. "
                 "Return false if the evidence only supports intermediate slots, related candidates, "
-                "or a seeded/parametric answer without retrieved support. "
+                "or if there is no retrieved evidence. "
                 'Return JSON only: {"supported":true,"reason":"..."}'
             ),
         },
         {
             "role": "user",
-            "content": f"Question: {question}\nProposed answer: {proposed_answer}\nEvidence:\n{evidence_context}",
+            "content": f"Question: {question}\nProposed answer: {proposed_answer or 'N/A'}\nActive evidence:\n{evidence_context}",
         },
     ]
 
@@ -200,6 +201,8 @@ def final_answer_prompt(question: str, evidence_context: str) -> list[dict[str, 
             "role": "system",
             "content": (
                 "Answer the question using only the evidence. Be concise. "
+                "Decompose the reasoning needed for the answer into atomic claims. "
+                "Assign each atomic claim one or more evidence identifiers from the provided evidence. "
                 "Return JSON only with answer and claim-level citations: "
                 '{"answer":"...","claims":[{"claim":"...","evidence_ids":["e1"]}]}'
             ),

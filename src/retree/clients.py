@@ -134,6 +134,8 @@ class DryRunLLMClient(LLMClient):
         if '"summary"' in prompt:
             content = _after_label(prompt, "Evidence:")
             return json.dumps({"summary": truncate_words(content.replace("\n", " "), 120)})
+        if '"label"' in prompt and "NLI judge" in prompt:
+            return json.dumps({"label": "entails", "reason": "Dry-run NLI assumes mock passage support."})
         if '"supported"' in prompt:
             return json.dumps({"supported": True, "reason": "Dry-run support check passes after retrieval."})
         if '"answer"' in prompt and '"claims"' in prompt:
@@ -248,6 +250,7 @@ def parse_search_response(data: Any, query: str, top_k: int, max_passage_chars: 
         text = str(safe_get(item, "text", "content", "snippet", "body", "description", default=""))
         if not text and "paragraphs" in item and isinstance(item["paragraphs"], list):
             text = "\n".join(str(part) for part in item["paragraphs"])
+        raw_text = text.strip()
         passages.append(
             SearchPassage(
                 id=f"p{index + 1}",
@@ -256,6 +259,7 @@ def parse_search_response(data: Any, query: str, top_k: int, max_passage_chars: 
                 url=url,
                 text=truncate_words(text.strip(), max(1, max_passage_chars // 5)),
                 rank=index + 1,
+                raw_text=raw_text,
                 raw=item,
             )
         )
@@ -276,6 +280,7 @@ def _mock_search(query: str, top_k: int, max_passage_chars: int) -> list[SearchP
             url=f"mock://result/{i + 1}",
             text=truncate_words(text, max(1, max_passage_chars // 5)),
             rank=i + 1,
+            raw_text=text,
             raw={},
         )
         for i in range(top_k)
